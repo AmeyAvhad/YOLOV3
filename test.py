@@ -1,8 +1,5 @@
 import argparse
 import json
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.metrics import confusion_matrix
 
 from torch.utils.data import DataLoader
 
@@ -77,10 +74,6 @@ def test(cfg,
     p, r, f1, mp, mr, map, mf1, t0, t1 = 0., 0., 0., 0., 0., 0., 0., 0., 0.
     loss = torch.zeros(3, device=device)
     jdict, stats, ap, ap_class = [], [], [], []
-    
-    # Confusion matrix initialization
-    confusion_matrix_all = np.zeros((nc, nc))
-
     for batch_i, (imgs, targets, paths, shapes) in enumerate(tqdm(dataloader, desc=s)):
         imgs = imgs.to(device).float() / 255.0  # uint8 to float32, 0 - 255 to 0.0 - 1.0
         targets = targets.to(device)
@@ -185,81 +178,60 @@ def test(cfg,
             # Append statistics (correct, conf, pcls, tcls)
             stats.append((correct.cpu(), pred[:, 4].cpu(), pred[:, 5].cpu(), tcls))
 
-            # Collect confusion matrix data
-            tcls_np = np.array(tcls)  # Convert to numpy array for astype(int)
-            for i in range(len(tcls_np)):
-                if len(pred) > 0:
-                    confusion_matrix_all[tcls_np[i].astype(int), int(pred[0, 5].item())] += 1
-                else:
-                    confusion_matrix_all[tcls_np[i].astype(int), tcls_np[i].astype(int)] += 1
-
-    # Plot confusion matrix
-    confusion_matrix_all = confusion_matrix_all.astype(int)
-    plt.figure(figsize=(10, 8))
-    sns.heatmap(confusion_matrix_all, annot=True, fmt=".2f", cmap="Blues", xticklabels=names, yticklabels=names)
-    plt.xlabel("Predicted Labels")
-    plt.ylabel("True Labels")
-    plt.title("Confusion Matrix")
-
-    # Create a new folder to save the image
-    output_folder = "confusion_matrix"
-    os.makedirs(output_folder, exist_ok=True)
-
-    # Save the confusion matrix image in the new folder
-    output_path = os.path.join(output_folder, "confusion_matrix.png")
-    plt.savefig(output_path)
-    plt.close()
-
-
     # Compute statistics
     stats = [np.concatenate(x, 0) for x in zip(*stats)]  # to numpy
-    if len(stats) and stats[0].any():
+    if len(stats):
         p, r, ap, f1, ap_class = ap_per_class(*stats)
-        ap50, ap = ap[:, 0], ap.mean(1)  # ap@0.5, ap@0.5:0.95
-        mp, mr, map50, map = p.mean(), r.mean(), ap50.mean(), ap.mean()
-        nt = np.bincount(stats[3].astype(int), minlength=nc)  # number of targets per class
+        if niou > 1:
+            p, r, ap, f1 = p[:, 0], r[:, 0], ap.mean(1), ap[:, 0]  # [P, R, AP@0.5:0.95, AP@0.5]
+        mp, mr, map, mf1 = p.mean(), r.mean(), ap.mean(), f1.mean()
+        nt = np.bincount(stats[3].astype(np.int64), minlength=nc)  # number of targets per class
     else:
         nt = torch.zeros(1)
 
     # Print results
     pf = '%20s' + '%10.3g' * 6  # print format
-    print(pf % ('all', seen, nt.sum(), mp, mr, map50, mf1), end='\n\n')
+    print(pf % ('all', seen, nt.sum(), mp, mr, map, mf1))
 
     # Print results per class
     if verbose and nc > 1 and len(stats):
         for i, c in enumerate(ap_class):
-            print(pf % (names[c], seen, nt[c].item(), p[i].item(), r[i].item(), ap50[i].item(), f1[i].item()))
+            print(pf % (names[c], seen, nt[c], p[i], r[i], ap[i], f1[i]))
 
     # Print speeds
     if verbose:
-        t = tuple(x / seen * 1E3 for x in [t0, t1, t0 + t1]) + (img_size, img_size, batch_size)  # tuple
+        t = tuple(x / seen * 1E3 for x in (t0, t1, t0 + t1)) + (img_size, img_size, batch_size)  # tuple
         print('Speed: %.1f/%.1f/%.1f ms inference/NMS/total per %gx%g image at batch-size %g' % t)
 
-    if save_json and map50 > 0.5:  # mAP50 > 0.5 to save
+    # Save JSON
+    if save_json and map and len(jdict):
         print('\nCOCO mAP with pycocotools...')
         imgIds = [int(Path(x).stem.split('_')[-1]) for x in dataloader.dataset.img_files]
         with open('results.json', 'w') as file:
             json.dump(jdict, file)
 
-        # Map to COCO format
         try:
             from pycocotools.coco import COCO
             from pycocotools.cocoeval import COCOeval
-
-            cocoGt = COCO(glob.glob('../coco/annotations/instances_val*.json')[0])  # initialize COCO ground truth api
-            cocoDt = cocoGt.loadRes('results.json')  # initialize COCO pred api
-            cocoEval = COCOeval(cocoGt, cocoDt, 'bbox')
-            cocoEval.params.imgIds = imgIds  # image IDs to evaluate
-            cocoEval.evaluate()
-            cocoEval.accumulate()
-            cocoEval.summarize()
-            map50, map = cocoEval.stats[:2]  # update results (mAP@0.5, mAP@0.5:0.95)
         except:
-            print('WARNING: missing pycocotools package, can not compute official COCO mAP.')
+            print('WARNING: missing pycocotools package, can not compute official COCO mAP. See requirements.txt.')
+
+        # https://github.com/cocodataset/cocoapi/blob/master/PythonAPI/pycocoEvalDemo.ipynb
+        cocoGt = COCO(glob.glob('../coco/annotations/instances_val*.json')[0])  # initialize COCO ground truth api
+        cocoDt = cocoGt.loadRes('results.json')  # initialize COCO pred api
+
+        cocoEval = COCOeval(cocoGt, cocoDt, 'bbox')
+        cocoEval.params.imgIds = imgIds  # [:32]  # only evaluate these images
+        cocoEval.evaluate()
+        cocoEval.accumulate()
+        cocoEval.summarize()
+        mf1, map = cocoEval.stats[:2]  # update to pycocotools results (mAP@0.5:0.95, mAP@0.5)
 
     # Return results
-    return (mp, mr, map50, map, *(loss.cpu() / len(dataloader)).tolist()), (p, r, ap50, f1, ap, ap_class)
-
+    maps = np.zeros(nc) + map
+    for i, c in enumerate(ap_class):
+        maps[c] = ap[i]
+    return (mp, mr, map, mf1, *(loss.cpu() / len(dataloader)).tolist()), maps
 
 
 if __name__ == '__main__':
